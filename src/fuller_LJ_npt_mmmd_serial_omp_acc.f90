@@ -652,7 +652,7 @@ contains
         !$OMP ATOMIC
         Fv((k-1)*3+c) = Fv((k-1)*3+c) + fk_c
         !$OMP ATOMIC
-        Fv((j-1)*3+c) = Fv((j-1)*3+c) - fi_c - fk_c
+        Fv((j-1)*3+c) = Fv((j-1)*3+c) - (fi_c + fk_c)
       end do
     end do
     !$OMP END PARALLEL DO
