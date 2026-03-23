@@ -1,0 +1,484 @@
+! SPDX-License-Identifier: BSD-3-Clause
+! Copyright (c) 2025, Takeshi Nishikawa
+!===========================================================================
+!  fuller_airebo_npt_md_serial_omp_acc.f90
+!  Fullerene Crystal NPT-MD
+!  (AIREBO: REBO-II + LJ, Serial / OpenMP, Fortran 95)
+!
+!  コンパイル:
+!    gfortran -O3 -o fuller_airebo_npt_md_serial fuller_airebo_npt_md_serial_omp_acc.f90
+!    gfortran -O3 -fopenmp -o fuller_airebo_npt_md_omp fuller_airebo_npt_md_serial_omp_acc.f90
+!  単位系: A, amu, eV, fs, K, GPa
+!===========================================================================
+module fuller_airebo_mod
+  implicit none
+  double precision, parameter :: CONV=9.64853321d-3, kB_=8.617333262d-5
+  double precision, parameter :: eV2GPa=160.21766208d0, eV2kcalmol=23.06054783d0
+  double precision, parameter :: PI_=3.14159265358979323846d0, mC_=12.011d0
+  ! REBO-II C-C パラメータ
+  double precision, parameter :: Q_CC=0.3134602960833d0, A_CC=10953.544162170d0
+  double precision, parameter :: alpha_CC=4.7465390606595d0
+  double precision, parameter :: B1_CC=12388.79197798d0, beta1_CC=4.7204523127d0
+  double precision, parameter :: B2_CC=17.56740646509d0, beta2_CC=1.4332132499d0
+  double precision, parameter :: B3_CC=30.71493208065d0, beta3_CC=1.3826912506d0
+  double precision, parameter :: Dmin_CC=1.7d0, Dmax_CC=2.0d0, BO_DELTA=0.5d0
+  double precision, parameter :: G_a0=0.00020813d0, G_c0=330.0d0, G_d0=3.5d0
+  ! LJ intermolecular
+  double precision, parameter :: sig_LJ=3.40d0, eps_LJ_=2.84d-3
+  double precision, parameter :: LJ_RCUT=3.0d0*sig_LJ, LJ_RCUT2=LJ_RCUT*LJ_RCUT
+  double precision, parameter :: sig2_LJ=sig_LJ*sig_LJ
+  double precision, parameter :: sr_v_=sig_LJ/LJ_RCUT, sr2_=sr_v_*sr_v_
+  double precision, parameter :: sr6_=sr2_*sr2_*sr2_
+  double precision, parameter :: LJ_VSHFT=4*eps_LJ_*(sr6_*sr6_-sr6_)
+  integer, parameter :: MAX_REBO_NEIGH=12, MAX_LJ_NEIGH=400
+  type :: NPTState
+    double precision :: xi,Q,Vg(9),W_,Pe,Tt
+    integer :: Nf
+  end type
+contains
+  double precision function mat_det9(h)
+    double precision, intent(in) :: h(9)
+    mat_det9=h(1)*(h(5)*h(9)-h(6)*h(8))-h(2)*(h(4)*h(9)-h(6)*h(7))+h(3)*(h(4)*h(8)-h(5)*h(7))
+  end function
+  subroutine mat_inv9(h,hi)
+    double precision, intent(in) :: h(9); double precision, intent(out) :: hi(9)
+    double precision :: d,id; d=mat_det9(h); id=1.0d0/d
+    hi(1)=id*(h(5)*h(9)-h(6)*h(8));hi(2)=id*(h(3)*h(8)-h(2)*h(9));hi(3)=id*(h(2)*h(6)-h(3)*h(5))
+    hi(4)=id*(h(6)*h(7)-h(4)*h(9));hi(5)=id*(h(1)*h(9)-h(3)*h(7));hi(6)=id*(h(3)*h(4)-h(1)*h(6))
+    hi(7)=id*(h(4)*h(8)-h(5)*h(7));hi(8)=id*(h(2)*h(7)-h(1)*h(8));hi(9)=id*(h(1)*h(5)-h(2)*h(4))
+  end subroutine
+  subroutine mimg9(dx,dy,dz,hi,h)
+    double precision, intent(inout) :: dx,dy,dz; double precision, intent(in) :: hi(9),h(9)
+    double precision :: s0,s1,s2
+    s0=hi(1)*dx+hi(2)*dy+hi(3)*dz;s1=hi(4)*dx+hi(5)*dy+hi(6)*dz;s2=hi(7)*dx+hi(8)*dy+hi(9)*dz
+    s0=s0-anint(s0);s1=s1-anint(s1);s2=s2-anint(s2)
+    dx=h(1)*s0+h(2)*s1+h(3)*s2;dy=h(4)*s0+h(5)*s1+h(6)*s2;dz=h(7)*s0+h(8)*s1+h(9)*s2
+  end subroutine
+  subroutine apply_pbc(pos,h,hi,N)
+    double precision, intent(inout) :: pos(:); double precision, intent(in) :: h(9),hi(9)
+    integer, intent(in) :: N; double precision :: px,py,pz,s0,s1,s2; integer :: i,idx
+    !$OMP PARALLEL DO PRIVATE(i,idx,px,py,pz,s0,s1,s2)
+    do i=1,N;idx=(i-1)*3;px=pos(idx+1);py=pos(idx+2);pz=pos(idx+3)
+      s0=hi(1)*px+hi(2)*py+hi(3)*pz;s1=hi(4)*px+hi(5)*py+hi(6)*pz;s2=hi(7)*px+hi(8)*py+hi(9)*pz
+      s0=s0-floor(s0);s1=s1-floor(s1);s2=s2-floor(s2)
+      pos(idx+1)=h(1)*s0+h(2)*s1+h(3)*s2;pos(idx+2)=h(4)*s0+h(5)*s1+h(6)*s2
+      pos(idx+3)=h(7)*s0+h(8)*s1+h(9)*s2
+    end do
+    !$OMP END PARALLEL DO
+  end subroutine
+  ! REBO device functions
+  double precision function fc_d(r,dmin,dmax)
+    double precision, intent(in) :: r,dmin,dmax
+    if(r<=dmin) then; fc_d=1; else if(r>=dmax) then; fc_d=0
+    else; fc_d=0.5d0*(1+cos(PI_*(r-dmin)/(dmax-dmin))); end if
+  end function
+  double precision function dfc_d(r,dmin,dmax)
+    double precision, intent(in) :: r,dmin,dmax
+    if(r<=dmin.or.r>=dmax) then; dfc_d=0
+    else; dfc_d=-0.5d0*PI_/(dmax-dmin)*sin(PI_*(r-dmin)/(dmax-dmin)); end if
+  end function
+  double precision function VR_CC(r)
+    double precision, intent(in) :: r; VR_CC=(1+Q_CC/r)*A_CC*exp(-alpha_CC*r)
+  end function
+  double precision function dVR_CC(r)
+    double precision, intent(in) :: r; double precision :: ex
+    ex=A_CC*exp(-alpha_CC*r); dVR_CC=(-Q_CC/(r*r))*ex+(1+Q_CC/r)*(-alpha_CC)*ex
+  end function
+  double precision function VA_CC(r)
+    double precision, intent(in) :: r
+    VA_CC=B1_CC*exp(-beta1_CC*r)+B2_CC*exp(-beta2_CC*r)+B3_CC*exp(-beta3_CC*r)
+  end function
+  double precision function dVA_CC(r)
+    double precision, intent(in) :: r
+    dVA_CC=-beta1_CC*B1_CC*exp(-beta1_CC*r)-beta2_CC*B2_CC*exp(-beta2_CC*r) &
+           -beta3_CC*B3_CC*exp(-beta3_CC*r)
+  end function
+  double precision function G_C(x)
+    double precision, intent(in) :: x; double precision :: c2,d2,hv
+    c2=G_c0*G_c0;d2=G_d0*G_d0;hv=1+x; G_C=G_a0*(1+c2/d2-c2/(d2+hv*hv))
+  end function
+  double precision function dG_C(x)
+    double precision, intent(in) :: x; double precision :: c2,d2,hv,dn
+    c2=G_c0*G_c0;d2=G_d0*G_d0;hv=1+x;dn=d2+hv*hv; dG_C=G_a0*2*c2*hv/(dn*dn)
+  end function
+  function make_fcc(a,nc,pos,h) result(Nmol)
+    double precision, intent(in) :: a; integer, intent(in) :: nc
+    double precision, intent(out) :: pos(:),h(9); integer :: Nmol,ix,iy,iz,b,idx
+    double precision :: bas(4,3)
+    bas(1,:)=(/0d0,0d0,0d0/);bas(2,:)=(/.5d0*a,.5d0*a,0d0/)
+    bas(3,:)=(/.5d0*a,0d0,.5d0*a/);bas(4,:)=(/0d0,.5d0*a,.5d0*a/); Nmol=0
+    do ix=0,nc-1;do iy=0,nc-1;do iz=0,nc-1;do b=1,4;Nmol=Nmol+1;idx=(Nmol-1)*3
+      pos(idx+1)=a*dble(ix)+bas(b,1);pos(idx+2)=a*dble(iy)+bas(b,2);pos(idx+3)=a*dble(iz)+bas(b,3)
+    end do;end do;end do;end do
+    h=0;h(1)=dble(nc)*a;h(5)=dble(nc)*a;h(9)=dble(nc)*a
+  end function
+  subroutine generate_c60_airebo(coords,natom,Rmol,Dmol)
+    double precision, intent(out) :: coords(84,3); integer, intent(out) :: natom
+    double precision, intent(out) :: Rmol,Dmol
+    double precision :: phi,tmp(60,3),cm(3),r2,r,dx,dy,dz,d
+    integer :: n,p,s1,s2,s3,cyc(3,3),signs(2),i,j
+    natom=60; phi=(1+sqrt(5.0d0))/2; signs(1)=-1;signs(2)=1
+    cyc(1,1)=1;cyc(1,2)=2;cyc(1,3)=3;cyc(2,1)=2;cyc(2,2)=3;cyc(2,3)=1
+    cyc(3,1)=3;cyc(3,2)=1;cyc(3,3)=2; tmp=0; n=0
+    do p=1,3;do s2=1,2;do s3=1,2;n=n+1;tmp(n,cyc(p,1))=0
+      tmp(n,cyc(p,2))=dble(signs(s2));tmp(n,cyc(p,3))=dble(signs(s3))*3*phi
+    end do;end do;end do
+    do p=1,3;do s1=1,2;do s2=1,2;do s3=1,2;n=n+1
+      tmp(n,cyc(p,1))=dble(signs(s1))*2;tmp(n,cyc(p,2))=dble(signs(s2))*(1+2*phi)
+      tmp(n,cyc(p,3))=dble(signs(s3))*phi
+    end do;end do;end do;end do
+    do p=1,3;do s1=1,2;do s2=1,2;do s3=1,2;n=n+1
+      tmp(n,cyc(p,1))=dble(signs(s1));tmp(n,cyc(p,2))=dble(signs(s2))*(2+phi)
+      tmp(n,cyc(p,3))=dble(signs(s3))*2*phi
+    end do;end do;end do;end do
+    cm=0; do n=1,60; cm=cm+tmp(n,:); end do; cm=cm/60
+    do n=1,60; tmp(n,:)=(tmp(n,:)-cm)*0.72d0; end do
+    Rmol=0;Dmol=0
+    do i=1,60;r2=tmp(i,1)**2+tmp(i,2)**2+tmp(i,3)**2;r=sqrt(r2);if(r>Rmol)Rmol=r
+      do j=i+1,60;dx=tmp(i,1)-tmp(j,1);dy=tmp(i,2)-tmp(j,2);dz=tmp(i,3)-tmp(j,3)
+        d=sqrt(dx*dx+dy*dy+dz*dz);if(d>Dmol)Dmol=d;end do;end do
+    coords(1:60,:)=tmp
+  end subroutine
+  ! REBO neighbor list (intra-molecular only)
+  subroutine build_nlist_rebo(pos,h,hi,Na,mol_id,nlc,nll)
+    double precision, intent(in) :: pos(:),h(9),hi(9)
+    integer, intent(in) :: Na,mol_id(:); integer, intent(out) :: nlc(:),nll(:)
+    double precision :: rc2,dx,dy,dz,r2; integer :: i,j
+    rc2=(Dmax_CC+0.3d0)**2; nlc(1:Na)=0
+    do i=1,Na-1; do j=i+1,Na
+      if(mol_id(j)/=mol_id(i)) cycle
+      dx=pos((j-1)*3+1)-pos((i-1)*3+1);dy=pos((j-1)*3+2)-pos((i-1)*3+2)
+      dz=pos((j-1)*3+3)-pos((i-1)*3+3); call mimg9(dx,dy,dz,hi,h); r2=dx*dx+dy*dy+dz*dz
+      if(r2<rc2) then
+        if(nlc(i)<MAX_REBO_NEIGH) then; nlc(i)=nlc(i)+1; nll((i-1)*MAX_REBO_NEIGH+nlc(i))=j; end if
+        if(nlc(j)<MAX_REBO_NEIGH) then; nlc(j)=nlc(j)+1; nll((j-1)*MAX_REBO_NEIGH+nlc(j))=i; end if
+      end if
+    end do; end do
+  end subroutine
+  ! LJ neighbor list (inter-molecular, half-list)
+  subroutine build_nlist_lj(pos,h,hi,Na,mol_id,nlc,nll)
+    double precision, intent(in) :: pos(:),h(9),hi(9)
+    integer, intent(in) :: Na,mol_id(:); integer, intent(out) :: nlc(:),nll(:)
+    double precision :: rc2,dx,dy,dz,r2; integer :: i,j
+    rc2=(LJ_RCUT+2)**2; nlc(1:Na)=0
+    do i=1,Na-1; do j=i+1,Na
+      if(mol_id(j)==mol_id(i)) cycle
+      dx=pos((j-1)*3+1)-pos((i-1)*3+1);dy=pos((j-1)*3+2)-pos((i-1)*3+2)
+      dz=pos((j-1)*3+3)-pos((i-1)*3+3); call mimg9(dx,dy,dz,hi,h); r2=dx*dx+dy*dy+dz*dz
+      if(r2<rc2.and.nlc(i)<MAX_LJ_NEIGH) then; nlc(i)=nlc(i)+1; nll((i-1)*MAX_LJ_NEIGH+nlc(i))=j; end if
+    end do; end do
+  end subroutine
+  ! REBO-II force
+  subroutine compute_rebo(F,vir9,pos,h,hi,nlc,nll,Na,Ep_rebo)
+    double precision, intent(inout) :: F(:),vir9(9)
+    double precision, intent(in) :: pos(:),h(9),hi(9)
+    integer, intent(in) :: nlc(:),nll(:),Na
+    double precision, intent(out) :: Ep_rebo
+    double precision :: dx,dy,dz,rij,fcut,dfcut,vr,dvr,va,dva,rij_inv
+    double precision :: Gs_ij,Gs_ji,bij,bji,bbar,fpair,costh,fc_ik,rik
+    double precision :: dkx,dky,dkz,dlx,dly,dlz,rjl
+    integer :: i,j,jn,k,kn,l,ln,nni,nnj
+    Ep_rebo=0
+    do i=1,Na; nni=nlc(i)
+      do jn=1,nni; j=nll((i-1)*MAX_REBO_NEIGH+jn); if(j<=i) cycle
+        dx=pos((j-1)*3+1)-pos((i-1)*3+1);dy=pos((j-1)*3+2)-pos((i-1)*3+2)
+        dz=pos((j-1)*3+3)-pos((i-1)*3+3); call mimg9(dx,dy,dz,hi,h)
+        rij=sqrt(dx*dx+dy*dy+dz*dz); if(rij>Dmax_CC) cycle
+        fcut=fc_d(rij,Dmin_CC,Dmax_CC); dfcut=dfc_d(rij,Dmin_CC,Dmax_CC)
+        if(fcut<1d-15.and.dfcut==0) cycle
+        vr=VR_CC(rij);dvr=dVR_CC(rij);va=VA_CC(rij);dva=dVA_CC(rij)
+        rij_inv=1/rij
+        ! b_ij
+        Gs_ij=0
+        do kn=1,nni; k=nll((i-1)*MAX_REBO_NEIGH+kn); if(k==j) cycle
+          dkx=pos((k-1)*3+1)-pos((i-1)*3+1);dky=pos((k-1)*3+2)-pos((i-1)*3+2)
+          dkz=pos((k-1)*3+3)-pos((i-1)*3+3); call mimg9(dkx,dky,dkz,hi,h)
+          rik=sqrt(dkx*dkx+dky*dky+dkz*dkz); if(rik>Dmax_CC) cycle
+          fc_ik=fc_d(rik,Dmin_CC,Dmax_CC); if(fc_ik<1d-15) cycle
+          costh=(dx*dkx+dy*dky+dz*dkz)/(rij*rik)
+          costh=max(-1.0d0,min(1.0d0,costh)); Gs_ij=Gs_ij+fc_ik*G_C(costh)
+        end do
+        bij=(1+Gs_ij)**(-BO_DELTA)
+        ! b_ji
+        Gs_ji=0; nnj=nlc(j)
+        do ln=1,nnj; l=nll((j-1)*MAX_REBO_NEIGH+ln); if(l==i) cycle
+          dlx=pos((l-1)*3+1)-pos((j-1)*3+1);dly=pos((l-1)*3+2)-pos((j-1)*3+2)
+          dlz=pos((l-1)*3+3)-pos((j-1)*3+3); call mimg9(dlx,dly,dlz,hi,h)
+          rjl=sqrt(dlx*dlx+dly*dly+dlz*dlz); if(rjl>Dmax_CC) cycle
+          fc_ik=fc_d(rjl,Dmin_CC,Dmax_CC); if(fc_ik<1d-15) cycle
+          costh=(-dx*dlx-dy*dly-dz*dlz)/(rij*rjl)
+          costh=max(-1.0d0,min(1.0d0,costh)); Gs_ji=Gs_ji+fc_ik*G_C(costh)
+        end do
+        bji=(1+Gs_ji)**(-BO_DELTA); bbar=0.5d0*(bij+bji)
+        Ep_rebo=Ep_rebo+fcut*(vr-bbar*va)
+        fpair=(dfcut*(vr-bbar*va)+fcut*(dvr-bbar*dva))*rij_inv
+        F((i-1)*3+1)=F((i-1)*3+1)+fpair*dx; F((i-1)*3+2)=F((i-1)*3+2)+fpair*dy
+        F((i-1)*3+3)=F((i-1)*3+3)+fpair*dz
+        F((j-1)*3+1)=F((j-1)*3+1)-fpair*dx; F((j-1)*3+2)=F((j-1)*3+2)-fpair*dy
+        F((j-1)*3+3)=F((j-1)*3+3)-fpair*dz
+        vir9(1)=vir9(1)-dx*fpair*dx; vir9(5)=vir9(5)-dy*fpair*dy; vir9(9)=vir9(9)-dz*fpair*dz
+      end do
+    end do
+  end subroutine
+  ! LJ intermolecular (half-list)
+  subroutine compute_lj(F,vir9,pos,h,hi,nlc,nll,Na,Ep_lj)
+    double precision, intent(inout) :: F(:),vir9(9)
+    double precision, intent(in) :: pos(:),h(9),hi(9)
+    integer, intent(in) :: nlc(:),nll(:),Na
+    double precision, intent(out) :: Ep_lj
+    double precision :: dx,dy,dz,r2,ri2,sr2,sr6,sr12,fm
+    integer :: i,jn,j,nni
+    Ep_lj=0
+    !$OMP PARALLEL DO PRIVATE(i,nni,jn,j,dx,dy,dz,r2,ri2,sr2,sr6,sr12,fm) &
+    !$OMP SCHEDULE(DYNAMIC,4) REDUCTION(+:Ep_lj)
+    do i=1,Na; nni=nlc(i)
+      do jn=1,nni; j=nll((i-1)*MAX_LJ_NEIGH+jn)
+        dx=pos((j-1)*3+1)-pos((i-1)*3+1);dy=pos((j-1)*3+2)-pos((i-1)*3+2)
+        dz=pos((j-1)*3+3)-pos((i-1)*3+3); call mimg9(dx,dy,dz,hi,h)
+        r2=dx*dx+dy*dy+dz*dz; if(r2>LJ_RCUT2) cycle; if(r2<0.25d0) r2=0.25d0
+        ri2=1/r2;sr2=sig2_LJ*ri2;sr6=sr2*sr2*sr2;sr12=sr6*sr6
+        fm=24*eps_LJ_*(2*sr12-sr6)*ri2; Ep_lj=Ep_lj+4*eps_LJ_*(sr12-sr6)-LJ_VSHFT
+        !$OMP ATOMIC
+        F((i-1)*3+1)=F((i-1)*3+1)-fm*dx
+        !$OMP ATOMIC
+        F((i-1)*3+2)=F((i-1)*3+2)-fm*dy
+        !$OMP ATOMIC
+        F((i-1)*3+3)=F((i-1)*3+3)-fm*dz
+        !$OMP ATOMIC
+        F((j-1)*3+1)=F((j-1)*3+1)+fm*dx
+        !$OMP ATOMIC
+        F((j-1)*3+2)=F((j-1)*3+2)+fm*dy
+        !$OMP ATOMIC
+        F((j-1)*3+3)=F((j-1)*3+3)+fm*dz
+        !$OMP ATOMIC
+        vir9(1)=vir9(1)+dx*fm*dx
+        !$OMP ATOMIC
+        vir9(5)=vir9(5)+dy*fm*dy
+        !$OMP ATOMIC
+        vir9(9)=vir9(9)+dz*fm*dz
+      end do
+    end do
+    !$OMP END PARALLEL DO
+  end subroutine
+  double precision function ke_total(vel,mass,Na)
+    double precision, intent(in) :: vel(:),mass(:); integer, intent(in) :: Na
+    double precision :: s; integer :: i,idx; s=0
+    !$OMP PARALLEL DO PRIVATE(i,idx) REDUCTION(+:s)
+    do i=1,Na;idx=(i-1)*3;s=s+mass(i)*(vel(idx+1)**2+vel(idx+2)**2+vel(idx+3)**2);end do
+    !$OMP END PARALLEL DO
+    ke_total=0.5d0*s/CONV
+  end function
+  double precision function inst_T(KE,Nf)
+    double precision, intent(in) :: KE; integer, intent(in) :: Nf; inst_T=2*KE/(dble(Nf)*kB_)
+  end function
+  double precision function inst_P(W,KE,V)
+    double precision, intent(in) :: W(9),KE,V; inst_P=(2*KE+W(1)+W(5)+W(9))/(3*V)*eV2GPa
+  end function
+  subroutine make_npt(npt,T,Pe,Na)
+    type(NPTState),intent(out)::npt;double precision,intent(in)::T,Pe;integer,intent(in)::Na
+    npt%Nf=3*Na-3;npt%xi=0;npt%Q=max(dble(npt%Nf)*kB_*T*1d4,1d-20);npt%Vg=0
+    npt%W_=max(dble(npt%Nf+9)*kB_*T*1d6,1d-20);npt%Pe=Pe;npt%Tt=T
+  end subroutine
+  double precision function clamp_val(x,lo,hi)
+    double precision, intent(in) :: x,lo,hi; clamp_val=max(lo,min(x,hi))
+  end function
+  subroutine step_npt_airebo(pos,vel,F,vir9,h,hi,mass,Na,dt,npt, &
+       nlc_r,nll_r,nlc_l,nll_l,Ep_rebo,Ep_lj,KE_out)
+    double precision, intent(inout) :: pos(:),vel(:),F(:),vir9(9),h(9),hi(9)
+    double precision, intent(in) :: mass(:),dt
+    integer, intent(in) :: Na,nlc_r(:),nll_r(:),nlc_l(:),nll_l(:)
+    type(NPTState), intent(inout) :: npt
+    double precision, intent(out) :: Ep_rebo,Ep_lj,KE_out
+    double precision :: hdt,V,KE,dP,eps,sc_nh,sc_pr,sc_v,mi
+    double precision :: px,py,pz,vx,vy,vz,sx,sy,sz,vsx,vsy,vsz,eps2,sv2,V2
+    integer :: i,a,idx
+    hdt=.5d0*dt; V=abs(mat_det9(h)); KE=ke_total(vel,mass,Na)
+    npt%xi=npt%xi+hdt*(2*KE-dble(npt%Nf)*kB_*npt%Tt)/npt%Q
+    npt%xi=clamp_val(npt%xi,-.05d0,.05d0)
+    dP=inst_P(vir9,KE,V)-npt%Pe
+    do a=0,2;npt%Vg(a*4+1)=npt%Vg(a*4+1)+hdt*V*dP/(npt%W_*eV2GPa)
+      npt%Vg(a*4+1)=clamp_val(npt%Vg(a*4+1),-.005d0,.005d0);end do
+    eps=npt%Vg(1)*hi(1)+npt%Vg(5)*hi(5)+npt%Vg(9)*hi(9)
+    sc_nh=exp(-hdt*npt%xi);sc_pr=exp(-hdt*eps/3);sc_v=sc_nh*sc_pr
+    !$OMP PARALLEL DO PRIVATE(i,idx,mi)
+    do i=1,Na;idx=(i-1)*3;mi=CONV/mass(i)
+      vel(idx+1)=vel(idx+1)*sc_v+hdt*F(idx+1)*mi
+      vel(idx+2)=vel(idx+2)*sc_v+hdt*F(idx+2)*mi
+      vel(idx+3)=vel(idx+3)*sc_v+hdt*F(idx+3)*mi
+    end do
+    !$OMP END PARALLEL DO
+    !$OMP PARALLEL DO PRIVATE(i,idx,px,py,pz,vx,vy,vz,sx,sy,sz,vsx,vsy,vsz)
+    do i=1,Na;idx=(i-1)*3
+      px=pos(idx+1);py=pos(idx+2);pz=pos(idx+3);vx=vel(idx+1);vy=vel(idx+2);vz=vel(idx+3)
+      sx=hi(1)*px+hi(2)*py+hi(3)*pz;sy=hi(4)*px+hi(5)*py+hi(6)*pz;sz=hi(7)*px+hi(8)*py+hi(9)*pz
+      vsx=hi(1)*vx+hi(2)*vy+hi(3)*vz;vsy=hi(4)*vx+hi(5)*vy+hi(6)*vz;vsz=hi(7)*vx+hi(8)*vy+hi(9)*vz
+      sx=sx+dt*vsx;sy=sy+dt*vsy;sz=sz+dt*vsz;sx=sx-floor(sx);sy=sy-floor(sy);sz=sz-floor(sz)
+      pos(idx+1)=sx;pos(idx+2)=sy;pos(idx+3)=sz
+    end do
+    !$OMP END PARALLEL DO
+    do a=0,2; do i=1,3; h(a*3+i)=h(a*3+i)+dt*npt%Vg(a*3+i); end do; end do
+    call mat_inv9(h,hi)
+    !$OMP PARALLEL DO PRIVATE(i,idx,sx,sy,sz)
+    do i=1,Na;idx=(i-1)*3;sx=pos(idx+1);sy=pos(idx+2);sz=pos(idx+3)
+      pos(idx+1)=h(1)*sx+h(2)*sy+h(3)*sz;pos(idx+2)=h(4)*sx+h(5)*sy+h(6)*sz
+      pos(idx+3)=h(7)*sx+h(8)*sy+h(9)*sz
+    end do
+    !$OMP END PARALLEL DO
+    F(1:Na*3)=0; vir9=0
+    call compute_rebo(F,vir9,pos,h,hi,nlc_r,nll_r,Na,Ep_rebo)
+    call compute_lj(F,vir9,pos,h,hi,nlc_l,nll_l,Na,Ep_lj)
+    eps2=npt%Vg(1)*hi(1)+npt%Vg(5)*hi(5)+npt%Vg(9)*hi(9)
+    sv2=sc_nh*exp(-hdt*eps2/3)
+    !$OMP PARALLEL DO PRIVATE(i,idx,mi)
+    do i=1,Na;idx=(i-1)*3;mi=CONV/mass(i)
+      vel(idx+1)=(vel(idx+1)+hdt*F(idx+1)*mi)*sv2
+      vel(idx+2)=(vel(idx+2)+hdt*F(idx+2)*mi)*sv2
+      vel(idx+3)=(vel(idx+3)+hdt*F(idx+3)*mi)*sv2
+    end do
+    !$OMP END PARALLEL DO
+    KE=ke_total(vel,mass,Na); KE_out=KE
+    npt%xi=npt%xi+hdt*(2*KE-dble(npt%Nf)*kB_*npt%Tt)/npt%Q
+    npt%xi=clamp_val(npt%xi,-.05d0,.05d0)
+    V2=abs(mat_det9(h)); dP=inst_P(vir9,KE,V2)-npt%Pe
+    do a=0,2;npt%Vg(a*4+1)=npt%Vg(a*4+1)+hdt*V2*dP/(npt%W_*eV2GPa)
+      npt%Vg(a*4+1)=clamp_val(npt%Vg(a*4+1),-.005d0,.005d0);end do
+  end subroutine
+  double precision function gauss_rand()
+    double precision :: u1,u2; call random_number(u1); call random_number(u2)
+    if(u1<1d-30)u1=1d-30; gauss_rand=sqrt(-2*log(u1))*cos(2*PI_*u2)
+  end function
+  subroutine get_opt_int(key,defval,res)
+    character(len=*),intent(in)::key;integer,intent(in)::defval;integer,intent(out)::res
+    integer::i,n,kl,ios;character(len=256)::arg;res=defval;n=command_argument_count();kl=len_trim(key)
+    do i=1,n;call get_command_argument(i,arg)
+      if(arg(1:kl+3)=='--'//key(1:kl)//'=') read(arg(kl+4:),*,iostat=ios) res
+    end do
+  end subroutine
+  subroutine get_opt_dbl(key,defval,res)
+    character(len=*),intent(in)::key;double precision,intent(in)::defval;double precision,intent(out)::res
+    integer::i,n,kl,ios;character(len=256)::arg;res=defval;n=command_argument_count();kl=len_trim(key)
+    do i=1,n;call get_command_argument(i,arg)
+      if(arg(1:kl+3)=='--'//key(1:kl)//'=') read(arg(kl+4:),*,iostat=ios) res
+    end do
+  end subroutine
+end module fuller_airebo_mod
+
+program fuller_airebo_npt_md
+  use fuller_airebo_mod
+  implicit none
+  integer :: nc,Nmol,natom,Na,nsteps,nlup,Nmax,i,a,gstep,nav,j
+  integer :: coldstart,warmup,avg_from,avg_to,total_steps,gavg_from,gavg_to
+  integer :: mon_int,prn,prn_pre,cur_prn,start_step
+  double precision :: T,Pe,dt,a0,Rmol,Dmol,T_cold,T_init,sv,scale_v,tgt
+  double precision :: Ep_rebo,Ep_lj,KE,Tn,Pn,V_val,an_val
+  double precision :: sT,sP,sa,sR,sL,sE,t_start,t_now,elapsed
+  double precision :: h(9),hi(9),vir9(9),vcm(3)
+  double precision :: mol_coords(84,3)
+  double precision, allocatable :: pos(:),vel(:),F(:),mass(:),mol_centers(:)
+  integer, allocatable :: mol_id(:),nlc_r(:),nll_r(:),nlc_l(:),nll_l(:)
+  type(NPTState) :: npt
+  T_cold=4.0d0
+  call get_opt_int('cell',3,nc); call get_opt_dbl('temp',298.0d0,T)
+  call get_opt_dbl('pres',0.0d0,Pe); call get_opt_int('step',10000,nsteps)
+  call get_opt_dbl('dt',0.5d0,dt); call get_opt_int('coldstart',0,coldstart)
+  call get_opt_int('warmup',0,warmup); call get_opt_int('from',0,avg_from)
+  call get_opt_int('to',0,avg_to); call get_opt_int('mon',0,mon_int)
+  if(avg_to<=0)avg_to=nsteps; if(avg_from<=0)avg_from=max(1,nsteps-nsteps/4)
+  total_steps=coldstart+warmup+nsteps
+  gavg_from=coldstart+warmup+avg_from; gavg_to=coldstart+warmup+avg_to
+  start_step=0; nlup=20
+  call generate_c60_airebo(mol_coords,natom,Rmol,Dmol)
+  a0=Dmol*sqrt(2.0d0)*1.4d0; Nmax=4*nc*nc*nc
+  allocate(mol_centers(Nmax*3)); mol_centers=0
+  Nmol=make_fcc(a0,nc,mol_centers,h); Na=Nmol*natom
+  allocate(pos(Na*3),vel(Na*3),F(Na*3),mass(Na),mol_id(Na))
+  allocate(nlc_r(Na),nll_r(Na*MAX_REBO_NEIGH),nlc_l(Na),nll_l(Na*MAX_LJ_NEIGH))
+  pos=0;vel=0;F=0;vir9=0;nlc_r=0;nll_r=0;nlc_l=0;nll_l=0
+  do i=1,Nmol; do a=1,natom; j=(i-1)*natom+a
+    pos((j-1)*3+1)=mol_centers((i-1)*3+1)+mol_coords(a,1)
+    pos((j-1)*3+2)=mol_centers((i-1)*3+2)+mol_coords(a,2)
+    pos((j-1)*3+3)=mol_centers((i-1)*3+3)+mol_coords(a,3)
+    mass(j)=mC_; mol_id(j)=i
+  end do; end do
+  deallocate(mol_centers)
+  write(*,'(A)') '========================================================================'
+  write(*,'(A)') '  Fullerene Crystal NPT-MD — AIREBO (Serial, Fortran 95)'
+  write(*,'(A)') '========================================================================'
+  write(*,'(A,I0,A)') '  Atoms/molecule  : ',natom
+  write(*,'(A,I0,A,I0,A,I0,A,I0,A,I0)') '  FCC ',nc,'x',nc,'x',nc,'  Nmol=',Nmol,'  Natom=',Na
+  write(*,'(A,F8.3,A,F6.1,A,F6.4,A,F5.3,A)') '  a0=',a0,' A  T=',T,' K  P=',Pe,' GPa  dt=',dt,' fs'
+  write(*,'(A,I0,A,I0)') '  Production: ',nsteps,' steps  Total=',total_steps
+  write(*,'(A)') '========================================================================'
+  write(*,*)
+  call mat_inv9(h,hi)
+  T_init=T; if(coldstart>0.or.warmup>0) T_init=T_cold
+  call random_seed()
+  do i=1,Na; sv=sqrt(kB_*T_init*CONV/mass(i))
+    do a=1,3; vel((i-1)*3+a)=sv*gauss_rand(); end do; end do
+  vcm=0; do i=1,Na; vcm(1)=vcm(1)+vel((i-1)*3+1); vcm(2)=vcm(2)+vel((i-1)*3+2)
+    vcm(3)=vcm(3)+vel((i-1)*3+3); end do
+  vcm=vcm/dble(Na)
+  do i=1,Na; vel((i-1)*3+1)=vel((i-1)*3+1)-vcm(1); vel((i-1)*3+2)=vel((i-1)*3+2)-vcm(2)
+    vel((i-1)*3+3)=vel((i-1)*3+3)-vcm(3); end do
+  call make_npt(npt,T,Pe,Na); npt%Tt=T_init
+  call build_nlist_rebo(pos,h,hi,Na,mol_id,nlc_r,nll_r)
+  call build_nlist_lj(pos,h,hi,Na,mol_id,nlc_l,nll_l)
+  call apply_pbc(pos,h,hi,Na)
+  F=0; vir9=0
+  call compute_rebo(F,vir9,pos,h,hi,nlc_r,nll_r,Na,Ep_rebo)
+  call compute_lj(F,vir9,pos,h,hi,nlc_l,nll_l,Na,Ep_lj)
+  prn=mon_int; if(prn<=0) prn=max(1,total_steps/50)
+  prn_pre=prn; if(coldstart+warmup>0) prn_pre=max(1,(coldstart+warmup)/100)
+  sT=0;sP=0;sa=0;sR=0;sL=0;sE=0;nav=0; call cpu_time(t_start)
+  write(*,'(A8,A6,A8,A10,A9,A12,A12,A12,A8)') &
+    'step','phase','T[K]','P[GPa]','a[A]','E_REBO','E_LJ','E_total','t[s]'
+  do gstep=start_step+1,total_steps
+    if(gstep<=coldstart) then; npt%Tt=T_cold
+    else if(gstep<=coldstart+warmup) then
+      npt%Tt=T_cold+(T-T_cold)*dble(gstep-coldstart)/dble(max(warmup,1))
+    else; npt%Tt=T; end if
+    if(coldstart>0.and.gstep==coldstart+1) then; npt%xi=0; npt%Vg=0; end if
+    if(gstep<=coldstart) npt%Vg=0
+    cur_prn=prn; if(gstep<=coldstart+warmup) cur_prn=prn_pre
+    if(mod(gstep,nlup)==0) then
+      call mat_inv9(h,hi)
+      call build_nlist_rebo(pos,h,hi,Na,mol_id,nlc_r,nll_r)
+      call build_nlist_lj(pos,h,hi,Na,mol_id,nlc_l,nll_l)
+    end if
+    call step_npt_airebo(pos,vel,F,vir9,h,hi,mass,Na,dt,npt,nlc_r,nll_r,nlc_l,nll_l,Ep_rebo,Ep_lj,KE)
+    V_val=abs(mat_det9(h)); Tn=inst_T(KE,npt%Nf); Pn=inst_P(vir9,KE,V_val)
+    if((gstep<=coldstart.or.gstep<=coldstart+warmup).and.Tn>0.1d0) then
+      tgt=T_cold; if(gstep>coldstart) tgt=npt%Tt
+      scale_v=sqrt(max(tgt,0.1d0)/Tn)
+      !$OMP PARALLEL DO PRIVATE(i)
+      do i=1,Na*3; vel(i)=vel(i)*scale_v; end do
+      !$OMP END PARALLEL DO
+      KE=ke_total(vel,mass,Na);Tn=inst_T(KE,npt%Nf);npt%xi=0
+      if(gstep<=coldstart) npt%Vg=0
+    end if
+    an_val=h(1)/dble(nc)
+    if(gstep>=gavg_from.and.gstep<=gavg_to) then
+      sT=sT+Tn;sP=sP+Pn;sa=sa+an_val;sR=sR+Ep_rebo/Nmol;sL=sL+Ep_lj/Nmol
+      sE=sE+(Ep_rebo+Ep_lj)/Nmol;nav=nav+1
+    end if
+    if(mod(gstep,cur_prn)==0.or.gstep==total_steps) then
+      call cpu_time(t_now); elapsed=t_now-t_start
+      if(gstep<=coldstart) then
+        write(*,'(I8,A6,F8.1,F10.3,F9.3,F12.4,F12.4,F12.4,F8.0)') &
+          gstep,' COLD',Tn,Pn,an_val,Ep_rebo/Nmol,Ep_lj/Nmol,(Ep_rebo+Ep_lj)/Nmol,elapsed
+      else if(gstep<=coldstart+warmup) then
+        write(*,'(I8,A6,F8.1,F10.3,F9.3,F12.4,F12.4,F12.4,F8.0)') &
+          gstep,' WARM',Tn,Pn,an_val,Ep_rebo/Nmol,Ep_lj/Nmol,(Ep_rebo+Ep_lj)/Nmol,elapsed
+      else
+        write(*,'(I8,A6,F8.1,F10.3,F9.3,F12.4,F12.4,F12.4,F8.0)') &
+          gstep,' PROD',Tn,Pn,an_val,Ep_rebo/Nmol,Ep_lj/Nmol,(Ep_rebo+Ep_lj)/Nmol,elapsed
+      end if
+    end if
+  end do
+  if(nav>0) then; write(*,*); write(*,'(A)') '========================================================================'
+    write(*,'(A,I0,A,F7.2,A,F8.4,A,F8.4,A,F10.4,A,F10.4,A,F10.4)') &
+      '  Avg(',nav,'): T=',sT/nav,' P=',sP/nav,' a=',sa/nav,' REBO=',sR/nav,' LJ=',sL/nav,' Total=',sE/nav
+    write(*,'(A)') '========================================================================'; end if
+  call cpu_time(t_now); write(*,'(A,F8.1,A)') '  Done (',t_now-t_start,' sec)'
+  deallocate(pos,vel,F,mass,mol_id,nlc_r,nll_r,nlc_l,nll_l)
+end program fuller_airebo_npt_md
